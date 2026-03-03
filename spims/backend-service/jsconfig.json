@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "checkJs": false,
+    "module": "commonjs",
+    "target": "es2020"
+  },
+  "include": [
+    "server.js",
+    "controllers/**/*.js",
+    "db/**/*.js",
+    "middleware/**/*.js",
+    "routes/**/*.js",
+    "services/**/*.js"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}
