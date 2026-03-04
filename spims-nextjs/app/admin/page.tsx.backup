@@ -1,0 +1,676 @@
+"use client";
+
+import Link from "next/link";
+import axios from "axios";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+
+type TotalEnergyResponse = {
+  area: string;
+  totalConsumption: number;
+  readings: number;
+  lastUpdated: string;
+};
+
+type AuthUser = {
+  id: number;
+  username: string;
+  role: "ADMIN" | "OPERATOR";
+};
+
+type AuthSession = {
+  accessToken: string;
+  refreshToken: string;
+  user: AuthUser;
+};
+
+type LoginResponse = AuthSession;
+
+type RefreshResponse = {
+  accessToken: string;
+};
+
+type ActiveStreetlightsResponse = {
+  active: number;
+  off: number;
+  fault: number;
+  total: number;
+};
+
+type FaultItem = {
+  id: number;
+  issue: string;
+  location: string;
+  resolved: boolean;
+  timestamp: string;
+  resolved_at: string | null;
+};
+
+type FaultsResponse = {
+  count: number;
+  items: FaultItem[];
+};
+
+type MonthlyReportResponse = {
+  month: string;
+  energyByDay: Array<{ day: string; totalConsumption: number }>;
+  faultsSummary: {
+    total_faults: number;
+    resolved_faults: number;
+    unresolved_faults: number;
+  };
+};
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:3000/api";
+const AUTH_STORAGE_KEY = "spims.admin.auth";
+
+function formatDate(value: string | null | undefined) {
+  if (!value) return "-";
+  return new Date(value).toLocaleString();
+}
+
+export default function AdminPage() {
+  const [session, setSession] = useState<AuthSession | null>(null);
+  const [username, setUsername] = useState("admin");
+  const [password, setPassword] = useState("admin123");
+  const [authLoading, setAuthLoading] = useState(false);
+
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [isResolving, setIsResolving] = useState<number | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
+
+  const [totalEnergy, setTotalEnergy] = useState<TotalEnergyResponse | null>(null);
+  const [streetlights, setStreetlights] = useState<ActiveStreetlightsResponse | null>(null);
+  const [faults, setFaults] = useState<FaultItem[]>([]);
+  const [report, setReport] = useState<MonthlyReportResponse | null>(null);
+
+  const saveSession = (nextSession: AuthSession | null) => {
+    setSession(nextSession);
+    if (typeof window === "undefined") return;
+
+    if (!nextSession) {
+      localStorage.removeItem(AUTH_STORAGE_KEY);
+      return;
+    }
+
+    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(nextSession));
+  };
+
+  const refreshAccessToken = useCallback(async (currentSession: AuthSession) => {
+    const { data } = await axios.post<RefreshResponse>(`${API_BASE}/auth/refresh`, {
+      refreshToken: currentSession.refreshToken,
+    });
+
+    const nextSession: AuthSession = {
+      ...currentSession,
+      accessToken: data.accessToken,
+    };
+    saveSession(nextSession);
+    return nextSession;
+  }, []);
+
+  const authRequest = useCallback(
+    async <T,>(
+      request: (token: string) => Promise<{ data: T }>,
+      currentSession: AuthSession
+    ): Promise<T> => {
+      try {
+        const response = await request(currentSession.accessToken);
+        return response.data;
+      } catch (requestError) {
+        if (!axios.isAxiosError(requestError) || requestError.response?.status !== 401) {
+          throw requestError;
+        }
+
+        const renewedSession = await refreshAccessToken(currentSession);
+        const retried = await request(renewedSession.accessToken);
+        return retried.data;
+      }
+    },
+    [refreshAccessToken]
+  );
+
+  const fetchDashboard = useCallback(async (currentSession: AuthSession) => {
+    try {
+      const [energyRes, streetlightsRes, faultsRes, reportRes] = await Promise.all([
+        authRequest(
+          (token) => axios.get<TotalEnergyResponse>(`${API_BASE}/total-energy`, { headers: { Authorization: `Bearer ${token}` } }),
+          currentSession
+        ),
+        authRequest(
+          (token) => axios.get<ActiveStreetlightsResponse>(`${API_BASE}/active-streetlights`, { headers: { Authorization: `Bearer ${token}` } }),
+          currentSession
+        ),
+        authRequest(
+          (token) => axios.get<FaultsResponse>(`${API_BASE}/faults?resolved=false&limit=8`, { headers: { Authorization: `Bearer ${token}` } }),
+          currentSession
+        ),
+        authRequest(
+          (token) => axios.get<MonthlyReportResponse>(`${API_BASE}/monthly-report`, { headers: { Authorization: `Bearer ${token}` } }),
+          currentSession
+        ),
+      ]);
+
+      setTotalEnergy(energyRes);
+      setStreetlights(streetlightsRes);
+      setFaults(faultsRes.items);
+      setReport(reportRes);
+      setError(null);
+    } catch (fetchError) {
+      setError("Failed to fetch admin dashboard data. Please login again.");
+      console.error(fetchError);
+    } finally {
+      setLoading(false);
+    }
+  }, [authRequest]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const stored = localStorage.getItem(AUTH_STORAGE_KEY);
+    if (!stored) return;
+
+    try {
+      const parsed = JSON.parse(stored) as AuthSession;
+      setSession(parsed);
+    } catch {
+      localStorage.removeItem(AUTH_STORAGE_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!session) {
+      setLoading(false);
+      return;
+    }
+
+    void fetchDashboard(session);
+    const interval = setInterval(() => {
+      void fetchDashboard(session);
+    }, 10000);
+
+    return () => clearInterval(interval);
+  }, [fetchDashboard, session]);
+
+  const chartData = useMemo(
+    () =>
+      (report?.energyByDay ?? []).map((item) => ({
+        ...item,
+        dayLabel: new Date(item.day).toLocaleDateString(undefined, {
+          day: "2-digit",
+          month: "short",
+        }),
+      })),
+    [report]
+  );
+
+  const handleResolveFault = async (id: number) => {
+    if (!session) return;
+    try {
+      setIsResolving(id);
+      await authRequest(
+        (token) =>
+          axios.post(
+            `${API_BASE}/resolve-fault`,
+            { faultId: id },
+            { headers: { Authorization: `Bearer ${token}` } }
+          ),
+        session
+      );
+      await fetchDashboard(session);
+    } catch (resolveError) {
+      console.error(resolveError);
+      setError("Failed to resolve fault");
+    } finally {
+      setIsResolving(null);
+    }
+  };
+
+  const handleLogin = async () => {
+    try {
+      setAuthLoading(true);
+      setError(null);
+      const { data } = await axios.post<LoginResponse>(`${API_BASE}/auth/login`, {
+        username,
+        password,
+      });
+      saveSession(data);
+      setLoading(true);
+    } catch (loginError) {
+      console.error(loginError);
+      setError("Invalid login credentials");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    if (!session) return;
+    try {
+      await axios.post(`${API_BASE}/auth/logout`, { refreshToken: session.refreshToken });
+    } catch {
+    } finally {
+      saveSession(null);
+      setFaults([]);
+      setReport(null);
+      setStreetlights(null);
+      setTotalEnergy(null);
+      setError(null);
+    }
+  };
+
+  const handleExportCsv = async () => {
+    if (!session) return;
+
+    try {
+      setIsExporting(true);
+      const blob = await authRequest<Blob>(
+        (token) =>
+          axios.get<Blob>(`${API_BASE}/export/energy-usage.csv`, {
+            headers: { Authorization: `Bearer ${token}` },
+            responseType: "blob",
+          }),
+        session
+      );
+
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `energy-usage-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (exportError) {
+      console.error(exportError);
+      setError("Failed to export CSV");
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  if (!session) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50 p-6">
+        <main className="w-full max-w-md">
+          <div className="mb-8 text-center">
+            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-600 to-indigo-600 shadow-xl">
+              <svg className="h-8 w-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+              </svg>
+            </div>
+            <h1 className="text-3xl font-bold text-zinc-900">Admin Login</h1>
+            <p className="mt-2 text-sm text-zinc-600">Sign in to access the dashboard</p>
+          </div>
+
+          <div className="rounded-2xl border border-zinc-200 bg-white p-8 shadow-2xl">
+            {error && (
+              <div className="mb-6 flex items-start gap-3 rounded-lg bg-red-50 border border-red-200 p-4">
+                <svg className="h-5 w-5 text-red-600 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <p className="text-sm text-red-700">{error}</p>
+              </div>
+            )}
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-zinc-700 mb-2">Username</label>
+                <input
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  className="w-full rounded-lg border border-zinc-300 bg-white px-4 py-3 text-zinc-900 placeholder-zinc-400 transition-all focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                  placeholder="Enter your username"
+                  onKeyDown={(e) => e.key === "Enter" && void handleLogin()}
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-zinc-700 mb-2">Password</label>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  className="w-full rounded-lg border border-zinc-300 bg-white px-4 py-3 text-zinc-900 placeholder-zinc-400 transition-all focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                  placeholder="Enter your password"
+                  onKeyDown={(e) => e.key === "Enter" && void handleLogin()}
+                />
+              </div>
+
+              <button
+                onClick={() => void handleLogin()}
+                disabled={authLoading}
+                className="w-full rounded-lg bg-gradient-to-r from-blue-600 to-indigo-600 px-4 py-3 font-semibold text-white shadow-lg shadow-blue-600/30 transition-all hover:shadow-xl hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100"
+              >
+                {authLoading ? (
+                  <span className="flex items-center justify-center gap-2">
+                    <svg className="animate-spin h-5 w-5" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    Signing in...
+                  </span>
+                ) : (
+                  "Sign In"
+                )}
+              </button>
+            </div>
+
+            <div className="mt-6 rounded-lg bg-blue-50 border border-blue-200 p-4">
+              <p className="text-xs font-medium text-blue-900 mb-2">Demo Credentials:</p>
+              <div className="space-y-1 text-xs text-blue-700">
+                <p><strong>Admin:</strong> admin / admin123</p>
+                <p><strong>Operator:</strong> operator / operator123</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-6 text-center">
+            <Link href="/" className="text-sm text-zinc-600 hover:text-blue-600 transition-colors">
+              ← Back to Home
+            </Link>
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-zinc-50 to-zinc-100">
+      {/* Top Navigation Bar */}
+      <nav className="border-b border-zinc-200 bg-white shadow-sm">
+        <div className="mx-auto max-w-7xl px-6 py-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-4">
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 text-white font-bold">
+                S
+              </div>
+              <div>
+                <h1 className="text-xl font-bold text-zinc-900">SPIMS Admin</h1>
+                <p className="text-xs text-zinc-500">
+                  <span className="relative flex h-2 w-2 inline-flex mr-1.5 align-middle">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+                  </span>
+                  Auto-refresh every 10s
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <div className="rounded-lg bg-zinc-100 px-3 py-2">
+                <p className="text-xs text-zinc-500">Logged in as</p>
+                <p className="text-sm font-semibold text-zinc-900">{session.user.username}</p>
+              </div>
+              <span className="rounded-full bg-gradient-to-r from-blue-600 to-indigo-600 px-3 py-1.5 text-xs font-semibold text-white">
+                {session.user.role}
+              </span>
+              <button
+                onClick={() => void handleExportCsv()}
+                disabled={isExporting}
+                className="rounded-lg bg-green-600 px-4 py-2 text-sm font-medium text-white transition-all hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isExporting ? (
+                  <span className="flex items-center gap-2">
+                    <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    Exporting...
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-2">
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    Export CSV
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => void handleLogout()}
+                className="rounded-lg bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition-all hover:bg-zinc-800"
+              >
+                Logout
+              </button>
+            </div>
+          </div>
+        </div>
+      </nav>
+
+      <main className="mx-auto max-w-7xl p-6 lg:p-8">
+        {error && (
+          <div className="mb-6 flex items-start gap-3 rounded-lg border border-red-300 bg-red-50 p-4">
+            <svg className="h-5 w-5 text-red-600 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <p className="text-sm text-red-700">{error}</p>
+          </div>
+        )}
+
+        {/* Metrics Cards */}
+        <section className="grid grid-cols-1 gap-6 md:grid-cols-2 xl:grid-cols-4 mb-8">
+          <article className="group rounded-2xl border border-blue-200 bg-gradient-to-br from-blue-50 to-white p-6 shadow-lg transition-all hover:shadow-xl hover:scale-[1.02]">
+            <div className="flex items-start justify-between mb-3">
+              <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 to-blue-600 text-white shadow-lg">
+                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+              </div>
+              <svg className="h-5 w-5 text-blue-400 opacity-0 group-hover:opacity-100 transition-opacity" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+              </svg>
+            </div>
+            <p className="text-sm font-medium text-zinc-600 mb-1">Total Energy Consumption</p>
+            <p className="text-3xl font-bold text-zinc-900">{totalEnergy?.totalConsumption.toFixed(2) ?? "0.00"}</p>
+            <p className="text-xs text-zinc-500 mt-1">kWh</p>
+          </article>
+
+          <article className="group rounded-2xl border border-green-200 bg-gradient-to-br from-green-50 to-white p-6 shadow-lg transition-all hover:shadow-xl hover:scale-[1.02]">
+            <div className="flex items-start justify-between mb-3">
+              <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-green-500 to-green-600 text-white shadow-lg">
+                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+                </svg>
+              </div>
+              <span className="rounded-full bg-green-100 px-2 py-1 text-xs font-semibold text-green-700">
+                {streetlights ? ((streetlights.active / streetlights.total) * 100).toFixed(0) : 0}%
+              </span>
+            </div>
+            <p className="text-sm font-medium text-zinc-600 mb-1">Active Streetlights</p>
+            <p className="text-3xl font-bold text-zinc-900">{streetlights?.active ?? 0}</p>
+            <p className="text-xs text-zinc-500 mt-1">of {streetlights?.total ?? 0} total</p>
+          </article>
+
+          <article className="group rounded-2xl border border-orange-200 bg-gradient-to-br from-orange-50 to-white p-6 shadow-lg transition-all hover:shadow-xl hover:scale-[1.02]">
+            <div className="flex items-start justify-between mb-3">
+              <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-orange-500 to-orange-600 text-white shadow-lg">
+                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+              </div>
+              {report && report.faultsSummary.unresolved_faults > 0 && (
+                <span className="relative flex h-3 w-3">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-orange-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-orange-500"></span>
+                </span>
+              )}
+            </div>
+            <p className="text-sm font-medium text-zinc-600 mb-1">Unresolved Faults</p>
+            <p className="text-3xl font-bold text-zinc-900">{report?.faultsSummary.unresolved_faults ?? 0}</p>
+            <p className="text-xs text-zinc-500 mt-1">
+              {report?.faultsSummary.resolved_faults ?? 0} resolved
+            </p>
+          </article>
+
+          <article className="group rounded-2xl border border-purple-200 bg-gradient-to-br from-purple-50 to-white p-6 shadow-lg transition-all hover:shadow-xl hover:scale-[1.02]">
+            <div className="flex items-start justify-between mb-3">
+              <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-purple-500 to-purple-600 text-white shadow-lg">
+                <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </div>
+            </div>
+            <p className="text-sm font-medium text-zinc-600 mb-1">Last Update</p>
+            <p className="text-sm font-bold text-zinc-900">{formatDate(totalEnergy?.lastUpdated)}</p>
+            <p className="text-xs text-zinc-500 mt-1">System synchronized</p>
+          </article>
+        </section>
+
+        {/* Charts and Alerts */}
+        <section className="grid grid-cols-1 gap-8 xl:grid-cols-3">
+          {/* Energy Trend Chart */}
+          <article className="xl:col-span-2 rounded-2xl border border-zinc-200 bg-white p-6 shadow-lg">
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h2 className="text-xl font-bold text-zinc-900">Monthly Energy Trend</h2>
+                <p className="text-sm text-zinc-500">Daily consumption for {report?.month ?? "this month"}</p>
+              </div>
+              <div className="rounded-lg bg-blue-50 px-3 py-2">
+                <p className="text-xs text-blue-600 font-medium">kWh</p>
+              </div>
+            </div>
+            <div className="h-80">
+              {loading ? (
+                <div className="flex h-full items-center justify-center">
+                  <div className="text-center">
+                    <svg className="animate-spin h-10 w-10 text-blue-600 mx-auto mb-3" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <p className="text-sm text-zinc-500">Loading chart data...</p>
+                  </div>
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={chartData}>
+                    <XAxis 
+                      dataKey="dayLabel" 
+                      stroke="#71717a"
+                      style={{ fontSize: '12px' }}
+                    />
+                    <YAxis 
+                      stroke="#71717a"
+                      style={{ fontSize: '12px' }}
+                    />
+                    <Tooltip 
+                      contentStyle={{
+                        backgroundColor: '#ffffff',
+                        border: '1px solid #e4e4e7',
+                        borderRadius: '0.5rem',
+                        boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'
+                      }}
+                    />
+                    <Line 
+                      type="monotone" 
+                      dataKey="totalConsumption" 
+                      stroke="#3b82f6" 
+                      strokeWidth={3} 
+                      dot={{ fill: '#3b82f6', strokeWidth: 2, r: 4 }}
+                      activeDot={{ r: 6, fill: '#2563eb' }}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+          </article>
+
+          {/* Fault Alerts */}
+          <article className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-lg">
+            <div className="flex items-center justify-between mb-6">
+              <div>
+                <h2 className="text-xl font-bold text-zinc-900">Fault Alerts</h2>
+                <p className="text-sm text-zinc-500">{faults.length} unresolved</p>
+              </div>
+              {faults.length > 0 && (
+                <span className="flex h-8 w-8 items-center justify-center rounded-full bg-orange-100 text-sm font-bold text-orange-600">
+                  {faults.length}
+                </span>
+              )}
+            </div>
+            <div className="max-h-96 space-y-4 overflow-y-auto pr-2">
+              {faults.length === 0 ? (
+                <div className="text-center py-12">
+                  <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-green-100">
+                    <svg className="h-8 w-8 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                  </div>
+                  <p className="text-sm font-medium text-zinc-900">All Clear!</p>
+                  <p className="text-xs text-zinc-500 mt-1">No unresolved faults</p>
+                </div>
+              ) : (
+                faults.map((fault) => (
+                  <div
+                    key={fault.id}
+                    className="group rounded-lg border-2 border-orange-200 bg-orange-50 p-4 transition-all hover:border-orange-300 hover:shadow-md"
+                  >
+                    <div className="mb-2 flex items-start justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="flex h-6 w-6 items-center justify-center rounded-full bg-orange-600 text-xs font-bold text-white">
+                          {fault.id}
+                        </span>
+                        <p className="text-sm font-bold text-orange-900">{fault.issue}</p>
+                      </div>
+                    </div>
+                    <div className="mb-3 space-y-1">
+                      <div className="flex items-center gap-2 text-xs text-orange-700">
+                        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                        </svg>
+                        {fault.location}
+                      </div>
+                      <div className="flex items-center gap-2 text-xs text-orange-700">
+                        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        {formatDate(fault.timestamp)}
+                      </div>
+                    </div>
+                    {session.user.role === "ADMIN" ? (
+                      <button
+                        type="button"
+                        onClick={() => void handleResolveFault(fault.id)}
+                        disabled={isResolving === fault.id}
+                        className="w-full rounded-lg bg-gradient-to-r from-green-600 to-green-700 px-3 py-2 text-sm font-semibold text-white transition-all hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isResolving === fault.id ? (
+                          <span className="flex items-center justify-center gap-2">
+                            <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            Resolving...
+                          </span>
+                        ) : (
+                          <span className="flex items-center justify-center gap-2">
+                            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                            </svg>
+                            Mark as Resolved
+                          </span>
+                        )}
+                      </button>
+                    ) : (
+                      <div className="rounded-lg bg-zinc-100 p-2 text-center">
+                        <p className="text-xs text-zinc-600">Only admins can resolve faults</p>
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </article>
+        </section>
+      </main>
+    </div>
+  );
+}
